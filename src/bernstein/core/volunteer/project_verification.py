@@ -11,6 +11,7 @@ shell fragments across the privilege boundary.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -19,9 +20,10 @@ import signal
 import subprocess
 import tempfile
 import time
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 PROJECT_VERIFICATION_SCHEMA = "bernstein.project-verification.v1"
 RECEIPT_TRAILER = "bernstein-receipt-bundle"
@@ -206,10 +208,8 @@ def run_gate(
                 os.killpg(process.pid, signal.SIGTERM)
                 process.wait(timeout=2)
             except (ProcessLookupError, subprocess.TimeoutExpired):
-                try:
+                with contextlib.suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
                 process.wait()
             exit_code = 124
 
@@ -291,7 +291,12 @@ def compare_project_observations(
             errors.append(FieldError(f"gates[{index}]", "attested gate was not observed by project CI"))
         else:
             if expected_command != actual_command:
-                errors.append(FieldError(f"gates[{index}].command", "attested command differs from project manifest gate"))
+                errors.append(
+                    FieldError(
+                        f"gates[{index}].command",
+                        "attested command differs from project manifest gate",
+                    )
+                )
             if expected_exit != actual_exit:
                 errors.append(
                     FieldError(
