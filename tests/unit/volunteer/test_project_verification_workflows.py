@@ -94,3 +94,24 @@ def test_missing_artifact_produces_a_failure_check() -> None:
     assert "Build missing-artifact failure check" in report
     assert '"conclusion": "failure"' in report
     assert "No verification claim is made." in report
+
+
+def test_malformed_artifact_also_produces_a_failure_check() -> None:
+    report = _text(REPORT)
+
+    assert "continue-on-error: true" in report
+    assert "Build malformed-artifact failure check" in report
+    assert "steps.render.outcome == 'failure'" in report
+    assert "verdict was malformed" in report
+    assert "untrusted artifact is not echoed here" in report
+
+
+def test_privileged_renderer_bounds_untrusted_markdown() -> None:
+    report = _text(REPORT)
+
+    assert "MAX_ERRORS = 128" in report
+    assert "MAX_GATES = 128" in report
+    assert "MAX_TEXT = 4096" in report
+    assert 're.sub(r"[\\x00-\\x1f\\x7f-\\x9f]", " ", text)' in report
+    assert '.replace("|", "\\\\|")' in report
+    assert '.replace("`", "\'")' in report
