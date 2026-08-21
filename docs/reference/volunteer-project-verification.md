@@ -85,17 +85,35 @@ This is the workflow allowed to execute fork-controlled code. It never has
 
 Triggered by `workflow_run` after the first workflow completes.
 
-- token: `actions: read`, `contents: read`, `checks: write`;
+- token: `actions: read`, `contents: read`, `pull-requests: read`,
+  `checks: write`;
 - never checks out repository code;
 - never executes code or command text from the pull request;
-- downloads only the named verdict artifact from that exact workflow run;
-- validates schema, bounded collection sizes, and `head_sha` against the
-  trusted `workflow_run` metadata;
+- resolves the triggering Actions run through GitHub's API and requires its
+  workflow path to be exactly `.github/workflows/volunteer-receipt-verify.yml`;
+- resolves the associated pull request and requires `workflow_run.head_sha` to
+  still equal the pull request's current head SHA;
+- fetches the producer-workflow metadata at both the trusted base SHA and the
+  candidate head SHA and requires the two Git blob SHAs to be identical;
+- only after that producer-definition check succeeds, downloads the named
+  verdict artifact from that exact workflow run;
+- validates schema, bounded collection sizes, and artifact `head_sha` against
+  the trusted `workflow_run` metadata;
 - renders bounded data into an advisory Check Run.
 
 A missing verdict artifact is a failing check with **no verification claim**.
 The privileged workflow must not silently interpret an absent artifact as a
 skip or success.
+
+A changed or same-name-spoofed producer workflow is also a failing check. This
+is a distinct boundary from validating the JSON artifact itself. A schema-valid
+artifact can still be forged if attacker-controlled workflow code was allowed
+to manufacture it. The reporter therefore authenticates the producer workflow
+**before it reads the artifact**. If the producer file differs from the trusted
+base definition, the artifact is neither downloaded nor interpreted.
+
+A pull request with no `bernstein-receipt-bundle:` marker remains opt-out: the
+producer job is skipped and the reporter does not create a noisy failure check.
 
 ## Why not `pull_request_target`?
 
@@ -106,6 +124,13 @@ more verbose because it preserves the actual trust boundary: fork code may run,
 or a workflow may write a Check Run, but no execution context gets both powers.
 
 Do not collapse the two workflows for convenience.
+
+The two-workflow split does not make `workflow_run` intrinsically safe. A fork
+can propose changes to workflow YAML just as it can propose changes to Python.
+If the privileged consumer accepted artifacts solely because they came from a
+workflow with the expected display name, a malicious PR could replace the
+producer logic and manufacture a green verdict. Producer-definition binding is
+therefore load-bearing, not defense-in-depth.
 
 ## Failure semantics
 
@@ -121,6 +146,12 @@ Malformed outer input is intentionally less descriptive when the underlying
 exception could contain attacker-controlled bytes. The untrusted workflow
 records a fixed failure category instead of forwarding raw exception text into
 a maintainer-facing privileged Check Run.
+
+The trusted workflow likewise emits fixed producer-authentication reason codes
+rather than attacker-controlled API values. A stale PR head, unexpected
+workflow path, unavailable producer blob, or changed producer workflow can make
+the check red, but none of those paths echo the untrusted workflow or artifact
+body into the privileged summary.
 
 ## Source
 
