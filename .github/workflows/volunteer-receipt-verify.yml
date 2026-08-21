@@ -165,7 +165,11 @@ jobs:
                   observed_gates=observations,
               )
           except Exception as exc:
-              message = f"{type(exc).__name__}: {exc}"[:2048]
+              # The exception may have been caused by attacker-controlled PR
+              # body/bundle bytes. Preserve only its class: the trusted
+              # workflow later renders this artifact into a maintainer-facing
+              # Check Run, so raw exception text must not cross that boundary.
+              reason = type(exc).__name__[:128]
               verdict = ProjectVerification(
                   ok=False,
                   head_sha=head_sha,
@@ -174,7 +178,12 @@ jobs:
                   bundle_verified=False,
                   manifest_digest_checked=False,
                   gates=(),
-                  errors=(FieldError("project_verification", message),),
+                  errors=(
+                      FieldError(
+                          "project_verification",
+                          f"project verification could not complete ({reason})",
+                      ),
+                  ),
               )
 
           verdict_path.write_text(
