@@ -21,12 +21,14 @@ jobs:
       - uses: ./.github/actions/bootstrap
         with:
           python-version: "3.13"
-      - name: Generate topology
-        run: uv run python scripts/gen_workflow_topology.py --update
+      - name: Generate final topology without this validation helper
+        run: |
+          mv .github/workflows/tmp-topology-emit.yml /tmp/tmp-topology-emit.yml
+          uv run python scripts/gen_workflow_topology.py --update
       - name: Upload generated topology
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: generated-ci-topology
+          name: generated-ci-topology-final
           path: docs/operations/ci-topology.md
           if-no-files-found: error
           retention-days: 1
