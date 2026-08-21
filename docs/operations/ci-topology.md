@@ -216,7 +216,7 @@ after workflow changes merge and opens a squash auto-merge PR when the committed
 | .github/workflows/trufflehog.yml | workflow: {"contents": "read"}<br>trufflehog: {"contents": "read", "pull-requests": "read"} | - |
 | .github/workflows/trunk-health-slo.yml | compute: {"actions": "read", "issues": "write"} | - |
 | .github/workflows/typecheck-ts.yml | workflow: {"contents": "read"}<br>typecheck: {"contents": "read"} | - |
-| .github/workflows/volunteer-receipt-report.yml | publish: {"actions": "read", "checks": "write", "contents": "read"} | - |
+| .github/workflows/volunteer-receipt-report.yml | publish: {"actions": "read", "checks": "write", "contents": "read", "pull-requests": "read"} | - |
 | .github/workflows/volunteer-receipt-verify.yml | workflow: {"contents": "read"}<br>verify: {"contents": "read"} | - |
 | .github/workflows/zizmor.yml | workflow: {"contents": "read"}<br>zizmor: {"actions": "read", "contents": "read", "security-events": "write"} | - |
 
