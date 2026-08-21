@@ -1,0 +1,133 @@
+name: Volunteer receipt report
+
+# Privileged half of #3880. This workflow receives checks:write only after the
+# read-only producer workflow has finished. It does NOT checkout repository
+# code and does NOT execute pull-request content. The only untrusted input is a
+# single bounded JSON artifact, validated against workflow_run.head_sha before
+# it is rendered into a Check Run payload.
+
+on:
+  workflow_run:
+    workflows: ["Volunteer receipt verification"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Publish project verification check
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      checks: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      DETAILS_URL: ${{ github.event.workflow_run.html_url }}
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - name: Find verdict artifact
+        id: artifact
+        run: |
+          set -euo pipefail
+          artifact_id=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts" \
+            --jq '[.artifacts[] | select(.name == "volunteer-project-verification")][0].id // empty')
+          echo "id=${artifact_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Download verdict artifact
+        if: steps.artifact.outputs.id != ''
+        env:
+          ARTIFACT_ID: ${{ steps.artifact.outputs.id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${REPO}/actions/artifacts/${ARTIFACT_ID}/zip" > verdict.zip
+          python - <<'PY'
+          import zipfile
+          with zipfile.ZipFile("verdict.zip") as zf:
+              names = zf.namelist()
+              if names != ["volunteer-project-verification.json"]:
+                  raise SystemExit(f"unexpected artifact members: {names!r}")
+              zf.extract(names[0], ".")
+          PY
+
+      - name: Validate and render check payload
+        if: steps.artifact.outputs.id != ''
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          MAX_ERRORS = 128
+          MAX_GATES = 128
+          MAX_TEXT = 4096
+          path = Path("volunteer-project-verification.json")
+          value = json.loads(path.read_text(encoding="utf-8"))
+          expected = {
+              "schema", "ok", "head_sha", "bundle_digest", "manifest_digest",
+              "bundle_verified", "manifest_digest_checked", "gates", "errors",
+          }
+          if set(value) != expected:
+              raise SystemExit("project-verification artifact has unexpected fields")
+          if value["schema"] != "bernstein.project-verification.v1":
+              raise SystemExit("unsupported project-verification schema")
+          if value["head_sha"] != os.environ["HEAD_SHA"]:
+              raise SystemExit("artifact head_sha does not match workflow_run head_sha")
+          if not isinstance(value["ok"], bool):
+              raise SystemExit("artifact ok must be boolean")
+          if not isinstance(value["gates"], list) or len(value["gates"]) > MAX_GATES:
+              raise SystemExit("artifact gate table is malformed or too large")
+          if not isinstance(value["errors"], list) or len(value["errors"]) > MAX_ERRORS:
+              raise SystemExit("artifact errors are malformed or too large")
+
+          lines = [
+              "Project-side receipt verification: " + ("PASS" if value["ok"] else "FAIL"),
+              "",
+              f"Receipt bundle: `{str(value['bundle_digest'])[:64]}`",
+              f"Manifest: `{str(value['manifest_digest'])[:64]}`",
+              "",
+              "| Gate | Attested | Project CI |",
+              "|---|---:|---:|",
+          ]
+          for gate in value["gates"]:
+              command = str(gate.get("command", ""))[:160].replace("|", "\\|")
+              lines.append(
+                  f"| `{command}` | {gate.get('attested_exit_code')} | {gate.get('observed_exit_code')} |"
+              )
+          if value["errors"]:
+              lines += ["", "Field-level differences:"]
+              for error in value["errors"]:
+                  field = str(error.get("field", "<unknown>"))[:160]
+                  message = str(error.get("message", ""))[:MAX_TEXT]
+                  lines.append(f"- `{field}`: {message}")
+
+          summary = "\n".join(lines)
+          payload = {
+              "name": "Volunteer receipt / project verification",
+              "head_sha": os.environ["HEAD_SHA"],
+              "status": "completed",
+              "conclusion": "success" if value["ok"] else "failure",
+              "details_url": os.environ["DETAILS_URL"],
+              "output": {
+                  "title": "Receipt and project gates agree" if value["ok"] else "Receipt/project verification diverged",
+                  "summary": summary[:65000],
+              },
+          }
+          Path("check-run.json").write_text(json.dumps(payload), encoding="utf-8")
+          PY
+
+      - name: Publish advisory Check Run
+        if: steps.artifact.outputs.id != ''
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${REPO}/check-runs" --input check-run.json
