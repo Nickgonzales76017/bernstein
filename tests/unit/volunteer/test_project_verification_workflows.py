@@ -68,7 +68,11 @@ def test_privileged_report_authenticates_the_producer_definition() -> None:
     assert 'candidate_blob != trusted_blob' in report
     assert 'reason = "producer_workflow_changed"' in report or 'TrustError("producer_workflow_changed")' in report
     assert "Build untrusted-producer failure check" in report
-    assert "Its artifact was not downloaded or interpreted" in report
+    # The runtime summary is formed by adjacent Python string literals. Assert
+    # both source fragments so this structural test verifies the assurance
+    # without depending on how the literal is line-wrapped in YAML.
+    assert "Its artifact was not downloaded or " in report
+    assert "interpreted. No verification claim is made." in report
 
 
 def test_artifact_is_unreachable_until_producer_is_trusted() -> None:
