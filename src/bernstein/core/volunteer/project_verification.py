@@ -9,6 +9,7 @@ The public helpers are pure except ``run_gate``. Workflows can therefore split
 untrusted execution from trusted comparison/reporting without passing code or
 shell fragments across the privilege boundary.
 """
+
 from __future__ import annotations
 
 import contextlib
@@ -30,9 +31,7 @@ RECEIPT_TRAILER = "bernstein-receipt-bundle"
 MAX_RECEIPT_PATH_CHARS = 512
 MAX_GATE_OUTPUT_BYTES = 4 * 1024 * 1024
 
-_TRAILER_RE = re.compile(
-    rf"(?mi)^\s*{re.escape(RECEIPT_TRAILER)}\s*:\s*(\S+)\s*$"
-)
+_TRAILER_RE = re.compile(rf"(?mi)^\s*{re.escape(RECEIPT_TRAILER)}\s*:\s*(\S+)\s*$")
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[/\\]")
 
 
@@ -126,9 +125,7 @@ def receipt_path_from_pr_body(body: str) -> str:
         raise ProjectVerificationError("pull request body must be text")
     matches = _TRAILER_RE.findall(body)
     if len(matches) != 1:
-        raise ProjectVerificationError(
-            f"pull request must contain exactly one {RECEIPT_TRAILER}: trailer"
-        )
+        raise ProjectVerificationError(f"pull request must contain exactly one {RECEIPT_TRAILER}: trailer")
     return _repo_relative_path(matches[0])
 
 
