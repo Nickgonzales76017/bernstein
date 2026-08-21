@@ -24,8 +24,11 @@ def test_fork_execution_and_check_write_are_separate_workflows() -> None:
 
     assert "workflow_run:" in report
     assert 'workflows: ["Volunteer receipt verification"]' in report
+    assert "# zizmor: ignore[dangerous-triggers]" in report
     assert "checks: write" in report
     assert "actions: read" in report
+    assert "contents: read" in report
+    assert "pull-requests: read" in report
     assert "actions/checkout@" not in report
 
 
@@ -53,6 +56,42 @@ def test_candidate_checkout_cannot_persist_credentials() -> None:
     assert "persist-credentials: false" in candidate
     assert "github.event.pull_request.head.sha" in candidate
     assert "github.event.pull_request.head.repo.full_name" in candidate
+
+
+def test_privileged_report_authenticates_the_producer_definition() -> None:
+    report = _text(REPORT)
+
+    assert "EXPECTED_PRODUCER_PATH: .github/workflows/volunteer-receipt-verify.yml" in report
+    assert 'run.get("path") != expected_path' in report
+    assert 'run.get("head_sha") != expected_head' in report
+    assert 'current_head != expected_head' in report
+    assert 'candidate_blob != trusted_blob' in report
+    assert 'reason = "producer_workflow_changed"' in report or 'TrustError("producer_workflow_changed")' in report
+    assert "Build untrusted-producer failure check" in report
+    assert "Its artifact was not downloaded or interpreted" in report
+
+
+def test_artifact_is_unreachable_until_producer_is_trusted() -> None:
+    report = _text(REPORT)
+
+    find_artifact = report.split("- name: Find verdict artifact", 1)[1].split(
+        "- name: Build missing-artifact failure check", 1
+    )[0]
+    download = report.split("- name: Download verdict artifact", 1)[1].split(
+        "- name: Validate and render check payload", 1
+    )[0]
+
+    assert "steps.producer.outputs.trusted == 'true'" in find_artifact
+    assert "steps.producer.outputs.trusted == 'true'" in download
+
+
+def test_no_trailer_does_not_create_a_noisy_failure_check() -> None:
+    report = _text(REPORT)
+
+    assert 'requested = "bernstein-receipt-bundle:" in body' in report
+    assert 'reason = "not_requested"' in report
+    publish = report.split("- name: Publish advisory Check Run", 1)[1]
+    assert "steps.producer.outputs.requested == 'true'" in publish
 
 
 def test_verdict_is_the_only_cross_privilege_artifact() -> None:
