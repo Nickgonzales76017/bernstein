@@ -43,6 +43,28 @@ jobs:
             --jq '[.artifacts[] | select(.name == "volunteer-project-verification")][0].id // empty')
           echo "id=${artifact_id}" >> "$GITHUB_OUTPUT"
 
+      - name: Build missing-artifact failure check
+        if: steps.artifact.outputs.id == ''
+        run: |
+          python - <<'PY'
+          import json, os
+          payload = {
+              "name": "Volunteer receipt / project verification",
+              "head_sha": os.environ["HEAD_SHA"],
+              "status": "completed",
+              "conclusion": "failure",
+              "details_url": os.environ["DETAILS_URL"],
+              "output": {
+                  "title": "Project verification produced no verdict",
+                  "summary": (
+                      "The read-only volunteer receipt workflow completed without "
+                      "its bounded verdict artifact. No verification claim is made."
+                  ),
+              },
+          }
+          open("check-run.json", "w", encoding="utf-8").write(json.dumps(payload))
+          PY
+
       - name: Download verdict artifact
         if: steps.artifact.outputs.id != ''
         env:
@@ -55,7 +77,7 @@ jobs:
           with zipfile.ZipFile("verdict.zip") as zf:
               names = zf.namelist()
               if names != ["volunteer-project-verification.json"]:
-                  raise SystemExit(f"unexpected artifact members: {names!r}")
+                  raise SystemExit("verdict artifact has an unexpected member set")
               zf.extract(names[0], ".")
           PY
 
@@ -66,11 +88,21 @@ jobs:
           python - <<'PY'
           import json
           import os
+          import re
           from pathlib import Path
 
           MAX_ERRORS = 128
           MAX_GATES = 128
           MAX_TEXT = 4096
+
+          def bounded_text(value, limit):
+              text = str(value)
+              # Untrusted artifact data becomes Markdown in a privileged
+              # Check Run. Keep it single-line and strip C0/C1 controls before
+              # bounding; field/error content is data, never terminal markup.
+              text = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text)
+              return text[:limit]
+
           path = Path("volunteer-project-verification.json")
           value = json.loads(path.read_text(encoding="utf-8"))
           expected = {
@@ -85,6 +117,10 @@ jobs:
               raise SystemExit("artifact head_sha does not match workflow_run head_sha")
           if not isinstance(value["ok"], bool):
               raise SystemExit("artifact ok must be boolean")
+          if not isinstance(value["bundle_verified"], bool):
+              raise SystemExit("artifact bundle_verified must be boolean")
+          if not isinstance(value["manifest_digest_checked"], bool):
+              raise SystemExit("artifact manifest_digest_checked must be boolean")
           if not isinstance(value["gates"], list) or len(value["gates"]) > MAX_GATES:
               raise SystemExit("artifact gate table is malformed or too large")
           if not isinstance(value["errors"], list) or len(value["errors"]) > MAX_ERRORS:
@@ -93,22 +129,26 @@ jobs:
           lines = [
               "Project-side receipt verification: " + ("PASS" if value["ok"] else "FAIL"),
               "",
-              f"Receipt bundle: `{str(value['bundle_digest'])[:64]}`",
-              f"Manifest: `{str(value['manifest_digest'])[:64]}`",
+              f"Receipt bundle: `{bounded_text(value['bundle_digest'], 64)}`",
+              f"Manifest: `{bounded_text(value['manifest_digest'], 64)}`",
               "",
               "| Gate | Attested | Project CI |",
               "|---|---:|---:|",
           ]
           for gate in value["gates"]:
-              command = str(gate.get("command", ""))[:160].replace("|", "\\|")
+              if not isinstance(gate, dict):
+                  raise SystemExit("artifact gate entry must be an object")
+              command = bounded_text(gate.get("command", ""), 160).replace("|", "\\|").replace("`", "'")
               lines.append(
                   f"| `{command}` | {gate.get('attested_exit_code')} | {gate.get('observed_exit_code')} |"
               )
           if value["errors"]:
               lines += ["", "Field-level differences:"]
               for error in value["errors"]:
-                  field = str(error.get("field", "<unknown>"))[:160]
-                  message = str(error.get("message", ""))[:MAX_TEXT]
+                  if not isinstance(error, dict):
+                      raise SystemExit("artifact error entry must be an object")
+                  field = bounded_text(error.get("field", "<unknown>"), 160).replace("`", "'")
+                  message = bounded_text(error.get("message", ""), MAX_TEXT)
                   lines.append(f"- `{field}`: {message}")
 
           summary = "\n".join(lines)
@@ -127,7 +167,7 @@ jobs:
           PY
 
       - name: Publish advisory Check Run
-        if: steps.artifact.outputs.id != ''
+        if: always() && hashFiles('check-run.json') != ''
         run: |
           set -euo pipefail
           gh api --method POST "repos/${REPO}/check-runs" --input check-run.json
