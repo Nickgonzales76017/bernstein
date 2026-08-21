@@ -82,7 +82,9 @@ jobs:
           PY
 
       - name: Validate and render check payload
+        id: render
         if: steps.artifact.outputs.id != ''
+        continue-on-error: true
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -97,9 +99,6 @@ jobs:
 
           def bounded_text(value, limit):
               text = str(value)
-              # Untrusted artifact data becomes Markdown in a privileged
-              # Check Run. Keep it single-line and strip C0/C1 controls before
-              # bounding; field/error content is data, never terminal markup.
               text = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text)
               return text[:limit]
 
@@ -164,6 +163,29 @@ jobs:
               },
           }
           Path("check-run.json").write_text(json.dumps(payload), encoding="utf-8")
+          PY
+
+      - name: Build malformed-artifact failure check
+        if: steps.artifact.outputs.id != '' && steps.render.outcome == 'failure'
+        run: |
+          python - <<'PY'
+          import json, os
+          payload = {
+              "name": "Volunteer receipt / project verification",
+              "head_sha": os.environ["HEAD_SHA"],
+              "status": "completed",
+              "conclusion": "failure",
+              "details_url": os.environ["DETAILS_URL"],
+              "output": {
+                  "title": "Project verification verdict was malformed",
+                  "summary": (
+                      "The read-only workflow produced an artifact, but the trusted "
+                      "consumer rejected its schema, bounds, or head binding. The "
+                      "untrusted artifact is not echoed here. No verification claim is made."
+                  ),
+              },
+          }
+          open("check-run.json", "w", encoding="utf-8").write(json.dumps(payload))
           PY
 
       - name: Publish advisory Check Run
