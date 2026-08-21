@@ -98,6 +98,13 @@ ADVISORY_BY_DECISION = {
         "Automation that merges Dependabot PRs once the required checks pass. It consumes "
         "the gate rather than being part of it."
     ),
+    "volunteer-receipt-verify.yml": (
+        "Opt-in project-side verification for pull requests that carry a signed volunteer "
+        "receipt. It intentionally stays on pull_request because it needs the PR body/head "
+        "and executes fork-controlled code with read-only permissions; the separate "
+        "workflow_run reporter publishes the advisory Check Run. It is not a merge-queue "
+        "required context."
+    ),
 }
 
 

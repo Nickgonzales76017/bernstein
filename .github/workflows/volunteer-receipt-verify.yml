@@ -1,0 +1,217 @@
+name: Volunteer receipt verification
+
+# Project-side verification for volunteer submissions (#3880).
+#
+# SECURITY BOUNDARY: this workflow executes fork-controlled code and therefore
+# has read-only repository access and receives no secrets. The trusted base ref
+# is checked out separately and loaded into the verifier process before any
+# candidate gate starts. Gate children receive a stripped environment and their
+# process group is terminated before the parent writes the verdict artifact.
+#
+# A second workflow, volunteer-receipt-report.yml, owns checks:write. It never
+# checks out or executes the pull-request head; it consumes only this workflow's
+# bounded JSON artifact after workflow_run provides a fresh privileged context.
+# Keep fork execution and privileged check publication in separate workflows.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review, edited]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: volunteer-receipt-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Re-run receipt gates
+    if: contains(github.event.pull_request.body || '', 'bernstein-receipt-bundle:')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout trusted base
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: trusted
+          persist-credentials: false
+
+      - name: Checkout candidate head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+
+      - name: Install trusted Bernstein
+        working-directory: trusted
+        run: uv sync --frozen
+
+      - name: Verify bundle and independently re-run project gates
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          VERDICT_PATH: ${{ runner.temp }}/volunteer-project-verification.json
+        run: |
+          set -euo pipefail
+          cd trusted
+          uv run python - <<'PY'
+          import json
+          import os
+          import subprocess
+          import time
+          from pathlib import Path
+
+          from bernstein.core.security.result_receipt_bundle import load_bundle
+          from bernstein.core.volunteer.manifest import load_manifest_from_repo
+          from bernstein.core.volunteer.project_verification import (
+              FieldError,
+              ProjectVerification,
+              compare_project_observations,
+              receipt_path_from_pr_body,
+              run_gate,
+          )
+
+          trusted = Path.cwd()
+          candidate = trusted.parent / "candidate"
+          verdict_path = Path(os.environ["VERDICT_PATH"])
+          head_sha = os.environ["PR_HEAD_SHA"]
+          manifest = load_manifest_from_repo(trusted)
+
+          try:
+              receipt_rel = receipt_path_from_pr_body(os.environ.get("PR_BODY", ""))
+              bundle_path = candidate / receipt_rel
+              if not bundle_path.is_file():
+                  raise ValueError("referenced receipt bundle is not a regular file in the PR head")
+
+              verify = subprocess.run(
+                  [
+                      "uv", "run", "bernstein", "receipt", "verify", str(bundle_path),
+                      "--expected-manifest-digest", manifest.digest, "--json",
+                  ],
+                  cwd=trusted,
+                  text=True,
+                  capture_output=True,
+                  check=False,
+              )
+              try:
+                  verify_json = json.loads(verify.stdout)
+              except json.JSONDecodeError:
+                  verify_json = {
+                      "ok": False,
+                      "digest": "",
+                      "manifest_digest_checked": False,
+                      "errors": [{"field": "bundle", "message": "receipt CLI did not emit valid JSON"}],
+                  }
+
+              attested_gates = []
+              if verify_json.get("ok") is True:
+                  envelope = load_bundle(bundle_path)
+                  payload = json.loads(envelope.payload_bytes)
+                  attested_gates = payload["predicate"]["bundle"].get("gates", [])
+
+              observations = []
+              if verify_json.get("ok") is True:
+                  started = time.monotonic()
+                  total_budget = max(1.0, float(manifest.max_wall_clock_minutes) * 60.0)
+                  for index, gate in enumerate(manifest.gates):
+                      remaining = total_budget - (time.monotonic() - started)
+                      if remaining <= 0:
+                          observations.append({
+                              "index": index,
+                              "argv": list(gate.argv),
+                              "command": " ".join(gate.argv),
+                              "exit_code": 124,
+                              "log_sha256": "",
+                              "elapsed_seconds": 0.0,
+                              "killed": True,
+                              "output_truncated": False,
+                          })
+                          continue
+                      observations.append(
+                          run_gate(
+                              gate.argv,
+                              cwd=candidate,
+                              index=index,
+                              timeout_seconds=remaining,
+                          )
+                      )
+
+              verdict = compare_project_observations(
+                  head_sha=head_sha,
+                  manifest_digest=manifest.digest,
+                  bundle_verification=verify_json,
+                  attested_gates=attested_gates,
+                  observed_gates=observations,
+              )
+          except Exception as exc:
+              # The exception may have been caused by attacker-controlled PR
+              # body/bundle bytes. Preserve only its class: the trusted
+              # workflow later renders this artifact into a maintainer-facing
+              # Check Run, so raw exception text must not cross that boundary.
+              reason = type(exc).__name__[:128]
+              verdict = ProjectVerification(
+                  ok=False,
+                  head_sha=head_sha,
+                  bundle_digest="",
+                  manifest_digest=manifest.digest,
+                  bundle_verified=False,
+                  manifest_digest_checked=False,
+                  gates=(),
+                  errors=(
+                      FieldError(
+                          "project_verification",
+                          f"project verification could not complete ({reason})",
+                      ),
+                  ),
+              )
+
+          verdict_path.write_text(
+              json.dumps(verdict.to_dict(), indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload bounded verdict
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: volunteer-project-verification
+          path: ${{ runner.temp }}/volunteer-project-verification.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Fail on verification divergence
+        if: always()
+        env:
+          VERDICT_PATH: ${{ runner.temp }}/volunteer-project-verification.json
+        run: |
+          python - <<'PY'
+          import json, os
+          path = os.environ["VERDICT_PATH"]
+          try:
+              verdict = json.load(open(path, encoding="utf-8"))
+          except Exception:
+              raise SystemExit(1)
+          raise SystemExit(0 if verdict.get("ok") is True else 1)
+          PY

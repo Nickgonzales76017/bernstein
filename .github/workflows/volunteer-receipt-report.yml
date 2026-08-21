@@ -1,0 +1,380 @@
+name: Volunteer receipt report
+
+# Privileged half of #3880. This workflow receives checks:write only after the
+# read-only producer workflow has finished. It does NOT checkout repository
+# code and does NOT execute pull-request content.
+#
+# Safety note (zizmor dangerous-triggers): workflow_run is intentional, but a
+# matching workflow name is not itself a trust boundary. Before this job reads
+# the producer artifact it resolves the triggering run and associated PR using
+# GitHub's API, requires the run path to be the exact producer path, requires
+# workflow_run.head_sha to still be the PR's current head SHA, and requires the
+# producer workflow blob at that head SHA to be byte-identical (Git blob SHA)
+# to the workflow blob at the PR's trusted base SHA. A fork PR that edits,
+# replaces, or same-name-spoofs the producer therefore gets a fixed red check;
+# its artifact is never downloaded or interpreted in this privileged context.
+# PR-controlled text is read only as data by a static Python program and never
+# interpolated into a shell command. The only cross-privilege payload accepted
+# after producer authentication is the bounded verdict JSON.
+on:  # zizmor: ignore[dangerous-triggers]
+  workflow_run:
+    workflows: ["Volunteer receipt verification"]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Publish project verification check
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+      checks: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      DETAILS_URL: ${{ github.event.workflow_run.html_url }}
+      EXPECTED_PRODUCER_PATH: .github/workflows/volunteer-receipt-verify.yml
+    steps:
+      - name: Harden runner (audit mode)
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: audit
+
+      - name: Authenticate producer workflow and current PR head
+        id: producer
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import Path
+
+          repo = os.environ["REPO"]
+          run_id = os.environ["RUN_ID"]
+          expected_head = os.environ["HEAD_SHA"]
+          expected_path = os.environ["EXPECTED_PRODUCER_PATH"]
+          output = Path(os.environ["GITHUB_OUTPUT"])
+
+          HEX40 = re.compile(r"^[0-9a-f]{40}$")
+          allowed_reasons = {
+              "not_requested",
+              "run_metadata_unavailable",
+              "unexpected_event",
+              "unexpected_workflow_path",
+              "ambiguous_pull_request",
+              "pull_request_unavailable",
+              "stale_head",
+              "invalid_revision",
+              "producer_blob_unavailable",
+              "producer_workflow_changed",
+              "trusted",
+          }
+
+          class TrustError(RuntimeError):
+              def __init__(self, reason):
+                  if reason not in allowed_reasons:
+                      reason = "run_metadata_unavailable"
+                  self.reason = reason
+
+          def gh_json(endpoint):
+              completed = subprocess.run(
+                  ["gh", "api", endpoint],
+                  text=True,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.DEVNULL,
+                  check=False,
+              )
+              if completed.returncode != 0:
+                  raise TrustError("run_metadata_unavailable")
+              try:
+                  value = json.loads(completed.stdout)
+              except json.JSONDecodeError as exc:
+                  raise TrustError("run_metadata_unavailable") from exc
+              if not isinstance(value, dict):
+                  raise TrustError("run_metadata_unavailable")
+              return value
+
+          requested = False
+          trusted = False
+          reason = "run_metadata_unavailable"
+          run = None
+
+          try:
+              run = gh_json(f"repos/{repo}/actions/runs/{run_id}")
+              if run.get("event") != "pull_request":
+                  raise TrustError("unexpected_event")
+              if run.get("path") != expected_path:
+                  raise TrustError("unexpected_workflow_path")
+              if run.get("head_sha") != expected_head:
+                  raise TrustError("stale_head")
+
+              pull_requests = run.get("pull_requests")
+              if not isinstance(pull_requests, list) or len(pull_requests) != 1:
+                  raise TrustError("ambiguous_pull_request")
+              pr_number = pull_requests[0].get("number") if isinstance(pull_requests[0], dict) else None
+              if not isinstance(pr_number, int) or pr_number <= 0:
+                  raise TrustError("ambiguous_pull_request")
+
+              try:
+                  pr = gh_json(f"repos/{repo}/pulls/{pr_number}")
+              except TrustError as exc:
+                  raise TrustError("pull_request_unavailable") from exc
+
+              body = pr.get("body")
+              body = body if isinstance(body, str) else ""
+              requested = "bernstein-receipt-bundle:" in body
+              if not requested:
+                  reason = "not_requested"
+                  raise TrustError(reason)
+
+              head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+              base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+              current_head = head.get("sha")
+              base_sha = base.get("sha")
+              if current_head != expected_head:
+                  raise TrustError("stale_head")
+              if not isinstance(base_sha, str) or not HEX40.fullmatch(base_sha):
+                  raise TrustError("invalid_revision")
+              if not isinstance(current_head, str) or not HEX40.fullmatch(current_head):
+                  raise TrustError("invalid_revision")
+
+              def content_meta(revision):
+                  endpoint = f"repos/{repo}/contents/{expected_path}?ref={revision}"
+                  completed = subprocess.run(
+                      ["gh", "api", endpoint],
+                      text=True,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.DEVNULL,
+                      check=False,
+                  )
+                  if completed.returncode != 0:
+                      raise TrustError("producer_blob_unavailable")
+                  try:
+                      value = json.loads(completed.stdout)
+                  except json.JSONDecodeError as exc:
+                      raise TrustError("producer_blob_unavailable") from exc
+                  if not isinstance(value, dict) or value.get("type") != "file":
+                      raise TrustError("producer_blob_unavailable")
+                  blob_sha = value.get("sha")
+                  if not isinstance(blob_sha, str) or not HEX40.fullmatch(blob_sha):
+                      raise TrustError("producer_blob_unavailable")
+                  return blob_sha
+
+              trusted_blob = content_meta(base_sha)
+              candidate_blob = content_meta(current_head)
+              if candidate_blob != trusted_blob:
+                  raise TrustError("producer_workflow_changed")
+
+              trusted = True
+              reason = "trusted"
+          except TrustError as exc:
+              reason = exc.reason
+              # If API metadata itself is unavailable but the triggering run
+              # was not skipped, fail closed as an attempted verification.
+              # A normal no-trailer PR produces a skipped producer run and
+              # therefore does not receive a noisy advisory failure check.
+              if run is not None and reason == "run_metadata_unavailable":
+                  requested = run.get("conclusion") != "skipped"
+
+          with output.open("a", encoding="utf-8") as handle:
+              handle.write(f"requested={'true' if requested else 'false'}\n")
+              handle.write(f"trusted={'true' if trusted else 'false'}\n")
+              handle.write(f"reason={reason}\n")
+          PY
+
+      - name: Build untrusted-producer failure check
+        if: steps.producer.outputs.requested == 'true' && steps.producer.outputs.trusted != 'true'
+        env:
+          TRUST_REASON: ${{ steps.producer.outputs.reason }}
+        run: |
+          python - <<'PY'
+          import json, os
+          reason = os.environ.get("TRUST_REASON", "producer_not_trusted")[:128]
+          payload = {
+              "name": "Volunteer receipt / project verification",
+              "head_sha": os.environ["HEAD_SHA"],
+              "status": "completed",
+              "conclusion": "failure",
+              "details_url": os.environ["DETAILS_URL"],
+              "output": {
+                  "title": "Producer workflow was not trusted",
+                  "summary": (
+                      "The privileged reporter could not authenticate the triggering "
+                      "verification workflow against the pull request's trusted base "
+                      f"definition ({reason}). Its artifact was not downloaded or "
+                      "interpreted. No verification claim is made."
+                  ),
+              },
+          }
+          open("check-run.json", "w", encoding="utf-8").write(json.dumps(payload))
+          PY
+
+      - name: Find verdict artifact
+        id: artifact
+        if: steps.producer.outputs.trusted == 'true'
+        run: |
+          set -euo pipefail
+          artifact_id=$(gh api "repos/${REPO}/actions/runs/${RUN_ID}/artifacts" \
+            --jq '[.artifacts[] | select(.name == "volunteer-project-verification")][0].id // empty')
+          echo "id=${artifact_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Build missing-artifact failure check
+        if: steps.producer.outputs.trusted == 'true' && steps.artifact.outputs.id == ''
+        run: |
+          python - <<'PY'
+          import json, os
+          payload = {
+              "name": "Volunteer receipt / project verification",
+              "head_sha": os.environ["HEAD_SHA"],
+              "status": "completed",
+              "conclusion": "failure",
+              "details_url": os.environ["DETAILS_URL"],
+              "output": {
+                  "title": "Project verification produced no verdict",
+                  "summary": (
+                      "The authenticated read-only volunteer receipt workflow completed "
+                      "without its bounded verdict artifact. No verification claim is made."
+                  ),
+              },
+          }
+          open("check-run.json", "w", encoding="utf-8").write(json.dumps(payload))
+          PY
+
+      - name: Download verdict artifact
+        if: steps.producer.outputs.trusted == 'true' && steps.artifact.outputs.id != ''
+        env:
+          ARTIFACT_ID: ${{ steps.artifact.outputs.id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${REPO}/actions/artifacts/${ARTIFACT_ID}/zip" > verdict.zip
+          python - <<'PY'
+          import zipfile
+          with zipfile.ZipFile("verdict.zip") as zf:
+              names = zf.namelist()
+              if names != ["volunteer-project-verification.json"]:
+                  raise SystemExit("verdict artifact has an unexpected member set")
+              zf.extract(names[0], ".")
+          PY
+
+      - name: Validate and render check payload
+        id: render
+        if: steps.producer.outputs.trusted == 'true' && steps.artifact.outputs.id != ''
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          MAX_ERRORS = 128
+          MAX_GATES = 128
+          MAX_TEXT = 4096
+
+          def bounded_text(value, limit):
+              text = str(value)
+              text = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", text)
+              return text[:limit]
+
+          path = Path("volunteer-project-verification.json")
+          value = json.loads(path.read_text(encoding="utf-8"))
+          expected = {
+              "schema", "ok", "head_sha", "bundle_digest", "manifest_digest",
+              "bundle_verified", "manifest_digest_checked", "gates", "errors",
+          }
+          if set(value) != expected:
+              raise SystemExit("project-verification artifact has unexpected fields")
+          if value["schema"] != "bernstein.project-verification.v1":
+              raise SystemExit("unsupported project-verification schema")
+          if value["head_sha"] != os.environ["HEAD_SHA"]:
+              raise SystemExit("artifact head_sha does not match workflow_run head_sha")
+          if not isinstance(value["ok"], bool):
+              raise SystemExit("artifact ok must be boolean")
+          if not isinstance(value["bundle_verified"], bool):
+              raise SystemExit("artifact bundle_verified must be boolean")
+          if not isinstance(value["manifest_digest_checked"], bool):
+              raise SystemExit("artifact manifest_digest_checked must be boolean")
+          if not isinstance(value["gates"], list) or len(value["gates"]) > MAX_GATES:
+              raise SystemExit("artifact gate table is malformed or too large")
+          if not isinstance(value["errors"], list) or len(value["errors"]) > MAX_ERRORS:
+              raise SystemExit("artifact errors are malformed or too large")
+
+          lines = [
+              "Project-side receipt verification: " + ("PASS" if value["ok"] else "FAIL"),
+              "",
+              f"Receipt bundle: `{bounded_text(value['bundle_digest'], 64)}`",
+              f"Manifest: `{bounded_text(value['manifest_digest'], 64)}`",
+              "",
+              "| Gate | Attested | Project CI |",
+              "|---|---:|---:|",
+          ]
+          for gate in value["gates"]:
+              if not isinstance(gate, dict):
+                  raise SystemExit("artifact gate entry must be an object")
+              command = bounded_text(gate.get("command", ""), 160).replace("|", "\\|").replace("`", "'")
+              lines.append(
+                  f"| `{command}` | {gate.get('attested_exit_code')} | {gate.get('observed_exit_code')} |"
+              )
+          if value["errors"]:
+              lines += ["", "Field-level differences:"]
+              for error in value["errors"]:
+                  if not isinstance(error, dict):
+                      raise SystemExit("artifact error entry must be an object")
+                  field = bounded_text(error.get("field", "<unknown>"), 160).replace("`", "'")
+                  message = bounded_text(error.get("message", ""), MAX_TEXT)
+                  lines.append(f"- `{field}`: {message}")
+
+          summary = "\n".join(lines)
+          payload = {
+              "name": "Volunteer receipt / project verification",
+              "head_sha": os.environ["HEAD_SHA"],
+              "status": "completed",
+              "conclusion": "success" if value["ok"] else "failure",
+              "details_url": os.environ["DETAILS_URL"],
+              "output": {
+                  "title": "Receipt and project gates agree" if value["ok"] else "Receipt/project verification diverged",
+                  "summary": summary[:65000],
+              },
+          }
+          Path("check-run.json").write_text(json.dumps(payload), encoding="utf-8")
+          PY
+
+      - name: Build malformed-artifact failure check
+        if: steps.producer.outputs.trusted == 'true' && steps.artifact.outputs.id != '' && steps.render.outcome == 'failure'
+        run: |
+          python - <<'PY'
+          import json, os
+          payload = {
+              "name": "Volunteer receipt / project verification",
+              "head_sha": os.environ["HEAD_SHA"],
+              "status": "completed",
+              "conclusion": "failure",
+              "details_url": os.environ["DETAILS_URL"],
+              "output": {
+                  "title": "Project verification verdict was malformed",
+                  "summary": (
+                      "The authenticated read-only workflow produced an artifact, but "
+                      "the trusted consumer rejected its schema, bounds, or head "
+                      "binding. The untrusted artifact is not echoed here. No "
+                      "verification claim is made."
+                  ),
+              },
+          }
+          open("check-run.json", "w", encoding="utf-8").write(json.dumps(payload))
+          PY
+
+      - name: Publish advisory Check Run
+        if: steps.producer.outputs.requested == 'true' && always() && hashFiles('check-run.json') != ''
+        run: |
+          set -euo pipefail
+          gh api --method POST "repos/${REPO}/check-runs" --input check-run.json

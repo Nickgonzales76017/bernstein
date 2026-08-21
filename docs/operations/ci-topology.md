@@ -74,6 +74,8 @@ after workflow changes merge and opens a squash auto-merge PR when the committed
 | .github/workflows/trufflehog.yml | trufflehog (secret scanning) | pull_request, push, schedule, workflow_dispatch | {"cancel-in-progress": "${{ github.event_name == 'pull_request' }}", "group": "trufflehog-${{ github.ref }}"} | 1 |
 | .github/workflows/trunk-health-slo.yml | Trunk Health SLO | schedule, workflow_dispatch | {"cancel-in-progress": "true", "group": "trunk-health-slo"} | 1 |
 | .github/workflows/typecheck-ts.yml | TypeScript typecheck | merge_group, pull_request, push | {"cancel-in-progress": "true", "group": "typecheck-ts-${{ github.event.pull_request.number \|\| github.ref }}"} | 1 |
+| .github/workflows/volunteer-receipt-report.yml | Volunteer receipt report | workflow_run | - | 1 |
+| .github/workflows/volunteer-receipt-verify.yml | Volunteer receipt verification | pull_request | {"cancel-in-progress": "true", "group": "volunteer-receipt-${{ github.event.pull_request.number }}"} | 1 |
 | .github/workflows/zizmor.yml | zizmor (workflow static analysis) | pull_request, push, schedule, workflow_dispatch | {"cancel-in-progress": "${{ github.event_name == 'pull_request' }}", "group": "zizmor-${{ github.ref }}"} | 1 |
 
 ## Check Emitters
@@ -143,6 +145,8 @@ after workflow changes merge and opens a squash auto-merge PR when the committed
 | .github/workflows/trufflehog.yml | trufflehog: trufflehog scan |
 | .github/workflows/trunk-health-slo.yml | compute: Compute trunk red-rate and toggle the andon marker |
 | .github/workflows/typecheck-ts.yml | typecheck: typecheck (${{ matrix.package }}) |
+| .github/workflows/volunteer-receipt-report.yml | publish: Publish project verification check |
+| .github/workflows/volunteer-receipt-verify.yml | verify: Re-run receipt gates |
 | .github/workflows/zizmor.yml | zizmor: zizmor static analysis |
 
 ## Permissions And Secrets
@@ -212,6 +216,8 @@ after workflow changes merge and opens a squash auto-merge PR when the committed
 | .github/workflows/trufflehog.yml | workflow: {"contents": "read"}<br>trufflehog: {"contents": "read", "pull-requests": "read"} | - |
 | .github/workflows/trunk-health-slo.yml | compute: {"actions": "read", "issues": "write"} | - |
 | .github/workflows/typecheck-ts.yml | workflow: {"contents": "read"}<br>typecheck: {"contents": "read"} | - |
+| .github/workflows/volunteer-receipt-report.yml | publish: {"actions": "read", "checks": "write", "contents": "read", "pull-requests": "read"} | - |
+| .github/workflows/volunteer-receipt-verify.yml | workflow: {"contents": "read"}<br>verify: {"contents": "read"} | - |
 | .github/workflows/zizmor.yml | workflow: {"contents": "read"}<br>zizmor: {"actions": "read", "contents": "read", "security-events": "write"} | - |
 
 ## Cross-Workflow Calls
@@ -244,3 +250,4 @@ after workflow changes merge and opens a squash auto-merge PR when the committed
 | .github/workflows/scorecard.yml | analysis: upload scorecard-results<br>upload: download scorecard-results |
 | .github/workflows/soc2-evidence-weekly.yml | pack: upload soc2-evidence-${{ github.run_id }} |
 | .github/workflows/static-analysis-extended.yml | perflint: upload perflint-sarif<br>refurb: upload refurb-sarif<br>semgrep: upload semgrep-sarif<br>trivy-fs: upload trivy-fs-sarif<br>trivy-iac: upload trivy-iac-sarif<br>vulture: upload vulture-sarif |
+| .github/workflows/volunteer-receipt-verify.yml | verify: upload volunteer-project-verification |
