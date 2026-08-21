@@ -11,7 +11,7 @@ name: Volunteer receipt verification
 # A second workflow, volunteer-receipt-report.yml, owns checks:write. It never
 # checks out or executes the pull-request head; it consumes only this workflow's
 # bounded JSON artifact after workflow_run provides a fresh privileged context.
-# Do not collapse these workflows into pull_request_target.
+# Keep fork execution and privileged check publication in separate workflows.
 
 on:
   pull_request:
