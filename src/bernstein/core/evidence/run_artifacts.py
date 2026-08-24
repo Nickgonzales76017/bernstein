@@ -27,15 +27,12 @@ independently verifiable.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
-import posixpath
 import re
 import threading
 import time
-import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, TypedDict, cast
@@ -52,6 +49,7 @@ from bernstein.core.defaults import (
 )
 from bernstein.core.evidence.bundle import DEFAULT_MAX_BLOB_BYTES, EvidenceStore
 from bernstein.core.lineage.spine import LineageSpine, content_hash_of
+from bernstein.core.tasks.artifacts import CanonicalisationError, canonicalise_finding
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -153,53 +151,6 @@ class FindingArtifactContent(TypedDict):
 type ArtifactContent = ReportArtifactContent | TableArtifactContent | LinkArtifactContent | FindingArtifactContent
 
 
-def _required_mapping(value: Mapping[str, Any], key: str, path: str) -> Mapping[str, Any]:
-    child = value.get(key)
-    if not isinstance(child, Mapping):
-        raise ArtifactValidationError(f"finding SARIF result is missing required field {path}.{key}")
-    return child
-
-
-def _required_string(value: Mapping[str, Any], key: str, path: str) -> str:
-    child = value.get(key)
-    if not isinstance(child, str) or not child:
-        raise ArtifactValidationError(f"finding SARIF result is missing required field {path}.{key}")
-    return child
-
-
-def _canonical_text(value: str) -> str:
-    """Fold the platform-dependent spellings of the same text into one form.
-
-    Two checkouts of the same source must address a finding identically, so the
-    preimage may not carry anything the platform chose rather than the author:
-
-    * line endings collapse to ``\\n`` -- a CRLF checkout on Windows and an LF
-      checkout on Linux are the same snippet; and
-    * the result is NFC-normalised -- macOS hands back decomposed (NFD) path
-      and text bytes where Linux hands back composed (NFC) ones, and ``café``
-      is one filename, not two.
-
-    This repairs where ``core.tasks.artifacts._canonical_text_bytes`` rejects,
-    and the difference is deliberate. There the text *is* the artifact, so a
-    caller shipping two byte-different spellings of it should hear about it.
-    Here the text is only a projection into an address -- the SARIF result is
-    stored verbatim beside it -- and the normal form was chosen by the
-    scanner's filesystem, not by anyone we can send an error to.
-    """
-    return unicodedata.normalize("NFC", value.replace("\r\n", "\n").replace("\r", "\n"))
-
-
-def _normalise_artifact_uri(uri: str) -> str:
-    normalised = posixpath.normpath(_canonical_text(uri).replace("\\", "/"))
-    if normalised in {"", "."}:
-        raise ArtifactValidationError("finding SARIF result has an empty normalized artifact URI")
-    return normalised.removeprefix("./")
-
-
-def _sha256_bytes(value: bytes) -> str:
-    return f"sha256:{hashlib.sha256(value).hexdigest()}"
-
-
 def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -214,40 +165,6 @@ def _build_finding_content(
     target: str,
 ) -> FindingArtifactContent:
     """Normalize one SARIF 2.1.0 result into a provenance-bound finding."""
-    rule_id = _required_string(sarif_result, "ruleId", "result")
-    locations = sarif_result.get("locations")
-    if not isinstance(locations, list) or not locations or not isinstance(locations[0], Mapping):
-        raise ArtifactValidationError("finding SARIF result is missing required field result.locations[0]")
-    physical = _required_mapping(locations[0], "physicalLocation", "result.locations[0]")
-    artifact_location = _required_mapping(physical, "artifactLocation", "result.locations[0].physicalLocation")
-    uri = _normalise_artifact_uri(
-        _required_string(artifact_location, "uri", "result.locations[0].physicalLocation.artifactLocation")
-    )
-    region = _required_mapping(physical, "region", "result.locations[0].physicalLocation")
-    snippet = _required_mapping(region, "snippet", "result.locations[0].physicalLocation.region")
-    snippet_text = _required_string(snippet, "text", "result.locations[0].physicalLocation.region.snippet")
-
-    start_line = region.get("startLine")
-    end_line = region.get("endLine", start_line)
-    if not isinstance(start_line, int) or start_line < 1:
-        raise ArtifactValidationError(
-            "finding SARIF result is missing required field result.locations[0].physicalLocation.region.startLine"
-        )
-    if not isinstance(end_line, int) or end_line < start_line:
-        raise ArtifactValidationError(
-            "finding SARIF result has invalid field result.locations[0].physicalLocation.region.endLine"
-        )
-    start_column = region.get("startColumn", 1)
-    end_column = region.get("endColumn", start_column)
-    if not isinstance(start_column, int) or start_column < 1:
-        raise ArtifactValidationError(
-            "finding SARIF result has invalid field result.locations[0].physicalLocation.region.startColumn"
-        )
-    if not isinstance(end_column, int) or end_column < start_column:
-        raise ArtifactValidationError(
-            "finding SARIF result has invalid field result.locations[0].physicalLocation.region.endColumn"
-        )
-
     provenance = {
         "tool": tool,
         "tool_version": tool_version,
@@ -255,37 +172,17 @@ def _build_finding_content(
         "invocation_argv_hash": invocation_argv_hash,
         "target": target,
     }
-    for key, value in provenance.items():
-        if not isinstance(value, str) or not value:
-            raise ArtifactValidationError(f"finding provenance requires non-empty {key}")
-
-    identity: dict[str, Any] = {
-        "rule_id": rule_id,
-        "artifact_uri": uri,
-        # Absolute lines are deliberately excluded: inserting blank lines above
-        # an unchanged finding must not change its content address.
-        "region": {
-            "line_span": end_line - start_line,
-            "start_column": start_column,
-            "end_column": end_column,
-        },
-        "snippet_hash": _sha256_bytes(_canonical_text(snippet_text).encode("utf-8")),
-    }
-    address_preimage = {"identity": identity, "provenance": provenance}
-    address = _sha256_bytes(_canonical_json_bytes(address_preimage))
+    try:
+        identity, location, address = canonicalise_finding(sarif_result, **provenance)
+    except CanonicalisationError as exc:
+        raise ArtifactValidationError(str(exc)) from exc
     return cast(
         FindingArtifactContent,
         {
             "type": ARTIFACT_TYPE_FINDING,
             "address": address,
             "identity": identity,
-            "location": {
-                "artifact_uri": uri,
-                "start_line": start_line,
-                "end_line": end_line,
-                "start_column": start_column,
-                "end_column": end_column,
-            },
+            "location": location,
             "provenance": provenance,
             "sarif_result": dict(sarif_result),
         },

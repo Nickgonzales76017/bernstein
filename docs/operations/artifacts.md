@@ -24,6 +24,7 @@ agent produced.
 | `dataset` | Canonical JSONL - one JCS-canonical JSON object per line, `\n`-separated |
 | `action_log` | Canonical JSONL (as `dataset`) |
 | `ops_result` | A single JCS-canonical JSON object |
+| `finding` | A strict SARIF result plus non-empty scanner provenance; its canonical address is shared with the normalized finding evidence writer |
 
 A task declares its kind through an `ArtifactSpec` on the task. Absent a spec,
 a task is `code_diff` and behaves exactly as before.

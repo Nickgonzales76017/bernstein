@@ -27,7 +27,9 @@ import hashlib
 import hmac as _hmac
 import json
 import operator
+import posixpath
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal
@@ -147,40 +149,106 @@ def _coerce_rows(raw: Any) -> list[Any]:
 # ---------------------------------------------------------------------------
 
 
-def _canonical_finding_bytes(raw: Any) -> bytes:
-    """Canonicalise a SARIF 2.1.0 finding artifact for content-addressing.
-    Projects the finding down to stable identity fields, deliberately dropping
-    the raw line number so cosmetic shifts don't change the hash. Binds tool
-    context so the identity is anchored to the exact invocation.
+def _finding_required_mapping(value: Mapping[str, Any], key: str, path: str) -> Mapping[str, Any]:
+    child = value.get(key)
+    if not isinstance(child, Mapping):
+        raise CanonicalisationError(f"finding SARIF result is missing required field {path}.{key}")
+    return child
+
+
+def _finding_required_string(value: Mapping[str, Any], key: str, path: str) -> str:
+    child = value.get(key)
+    if not isinstance(child, str) or not child:
+        raise CanonicalisationError(f"finding SARIF result is missing required field {path}.{key}")
+    return child
+
+
+def canonicalise_finding(
+    sarif_result: Mapping[str, Any],
+    *,
+    tool: str,
+    tool_version: str,
+    pinned_ruleset_or_feed_digest: str,
+    invocation_argv_hash: str,
+    target: str,
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    """Return the canonical identity, location, and address for one SARIF finding.
+
+    Both task artifact and evidence paths use this dependency-free leaf. It
+    rejects incomplete input rather than minting an address for an empty shape.
     """
-    if not isinstance(raw, dict):
-        raise CanonicalisationError(f"finding artifact must be a mapping, got {type(raw).__name__}")
-
-    # Extract SARIF result fields
-    rule_id = str(raw.get("ruleId", ""))
-
-    # Normalise artifact location URI to forward slashes
-    artifact_location = raw.get("artifactLocation", {})
-    uri = str(artifact_location.get("uri", "")).replace("\\", "/")
-
-    # Hash the snippet text instead of using the raw line number
-    region = raw.get("region", {})
-    snippet_text = str(region.get("snippet", {}).get("text", ""))
-    snippet_hash = "sha256:" + hashlib.sha256(snippet_text.encode("utf-8")).hexdigest()
-
-    # Bind context fields required by the issue
-    projected = {
-        "ruleId": rule_id,
-        "uri": uri,
-        "snippet_hash": snippet_hash,
-        "tool": str(raw.get("tool", "")),
-        "tool_version": str(raw.get("tool_version", "")),
-        "pinned_digest": str(raw.get("pinned_digest", "")),
-        "invocation_argv_hash": str(raw.get("invocation_argv_hash", "")),
-        "target": str(raw.get("target", "")),
+    rule_id = _finding_required_string(sarif_result, "ruleId", "result")
+    locations = sarif_result.get("locations")
+    if not isinstance(locations, list) or not locations or not isinstance(locations[0], Mapping):
+        raise CanonicalisationError("finding SARIF result is missing required field result.locations[0]")
+    physical = _finding_required_mapping(locations[0], "physicalLocation", "result.locations[0]")
+    artifact_location = _finding_required_mapping(physical, "artifactLocation", "result.locations[0].physicalLocation")
+    uri = _finding_required_string(artifact_location, "uri", "result.locations[0].physicalLocation.artifactLocation")
+    uri = posixpath.normpath(unicodedata.normalize("NFC", _normalise_newlines(uri)).replace("\\", "/"))
+    if uri in {"", "."}:
+        raise CanonicalisationError("finding SARIF result has an empty normalized artifact URI")
+    uri = uri.removeprefix("./")
+    region = _finding_required_mapping(physical, "region", "result.locations[0].physicalLocation")
+    snippet = _finding_required_mapping(region, "snippet", "result.locations[0].physicalLocation.region")
+    snippet_text = _finding_required_string(snippet, "text", "result.locations[0].physicalLocation.region.snippet")
+    start_line = region.get("startLine")
+    end_line = region.get("endLine", start_line)
+    if not isinstance(start_line, int) or start_line < 1:
+        raise CanonicalisationError("finding SARIF result is missing required field result.locations[0].physicalLocation.region.startLine")
+    if not isinstance(end_line, int) or end_line < start_line:
+        raise CanonicalisationError("finding SARIF result has invalid field result.locations[0].physicalLocation.region.endLine")
+    start_column = region.get("startColumn", 1)
+    end_column = region.get("endColumn", start_column)
+    if not isinstance(start_column, int) or start_column < 1:
+        raise CanonicalisationError("finding SARIF result has invalid field result.locations[0].physicalLocation.region.startColumn")
+    if not isinstance(end_column, int) or end_column < start_column:
+        raise CanonicalisationError("finding SARIF result has invalid field result.locations[0].physicalLocation.region.endColumn")
+    provenance = {
+        "tool": tool,
+        "tool_version": tool_version,
+        "pinned_ruleset_or_feed_digest": pinned_ruleset_or_feed_digest,
+        "invocation_argv_hash": invocation_argv_hash,
+        "target": target,
     }
+    for key, value in provenance.items():
+        if not isinstance(value, str) or not value:
+            raise CanonicalisationError(f"finding provenance requires non-empty {key}")
+    snippet_hash = content_hash(unicodedata.normalize("NFC", _normalise_newlines(snippet_text)).encode("utf-8"))
+    identity: dict[str, Any] = {
+        "rule_id": rule_id,
+        "artifact_uri": uri,
+        "region": {"line_span": end_line - start_line, "start_column": start_column, "end_column": end_column},
+        "snippet_hash": snippet_hash,
+    }
+    location = {
+        "artifact_uri": uri,
+        "start_line": start_line,
+        "end_line": end_line,
+        "start_column": start_column,
+        "end_column": end_column,
+    }
+    return identity, location, content_hash(_canonical_json_bytes({"identity": identity, "provenance": provenance}))
 
-    return _canonical_json_bytes(projected)
+
+def _canonical_finding_bytes(raw: Any) -> bytes:
+    """Canonicalise a provenance-bound SARIF finding envelope for its address."""
+    if not isinstance(raw, Mapping):
+        raise CanonicalisationError(f"finding artifact must be a mapping, got {type(raw).__name__}")
+    sarif_result = raw.get("sarif_result")
+    provenance = raw.get("provenance")
+    if not isinstance(sarif_result, Mapping):
+        raise CanonicalisationError("finding artifact is missing required mapping sarif_result")
+    if not isinstance(provenance, Mapping):
+        raise CanonicalisationError("finding artifact is missing required mapping provenance")
+    identity, _location, _address = canonicalise_finding(
+        sarif_result,
+        tool=provenance.get("tool", ""),
+        tool_version=provenance.get("tool_version", ""),
+        pinned_ruleset_or_feed_digest=provenance.get("pinned_ruleset_or_feed_digest", ""),
+        invocation_argv_hash=provenance.get("invocation_argv_hash", ""),
+        target=provenance.get("target", ""),
+    )
+    return _canonical_json_bytes({"identity": identity, "provenance": dict(provenance)})
 
 
 def canonicalise_artifact(kind: ArtifactKind | str, raw: Any) -> bytes:
