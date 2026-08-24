@@ -194,15 +194,23 @@ def canonicalise_finding(
     start_line = region.get("startLine")
     end_line = region.get("endLine", start_line)
     if not isinstance(start_line, int) or start_line < 1:
-        raise CanonicalisationError("finding SARIF result is missing required field result.locations[0].physicalLocation.region.startLine")
+        raise CanonicalisationError(
+            "finding SARIF result is missing required field result.locations[0].physicalLocation.region.startLine"
+        )
     if not isinstance(end_line, int) or end_line < start_line:
-        raise CanonicalisationError("finding SARIF result has invalid field result.locations[0].physicalLocation.region.endLine")
+        raise CanonicalisationError(
+            "finding SARIF result has invalid field result.locations[0].physicalLocation.region.endLine"
+        )
     start_column = region.get("startColumn", 1)
     end_column = region.get("endColumn", start_column)
     if not isinstance(start_column, int) or start_column < 1:
-        raise CanonicalisationError("finding SARIF result has invalid field result.locations[0].physicalLocation.region.startColumn")
+        raise CanonicalisationError(
+            "finding SARIF result has invalid field result.locations[0].physicalLocation.region.startColumn"
+        )
     if not isinstance(end_column, int) or end_column < start_column:
-        raise CanonicalisationError("finding SARIF result has invalid field result.locations[0].physicalLocation.region.endColumn")
+        raise CanonicalisationError(
+            "finding SARIF result has invalid field result.locations[0].physicalLocation.region.endColumn"
+        )
     provenance = {
         "tool": tool,
         "tool_version": tool_version,
